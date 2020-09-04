@@ -1,0 +1,531 @@
+---
+title: "july2020 maine poll"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    code_folding: hide
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r lib, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(forcats)
+library(dplyr)
+library(glue)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(cowplot)
+```
+
+##### Helper functions + data
+```{r actual_results}
+
+nCraft_first_round <- 19337
+nBennet_first_round <- 13468
+Brakey_transfer <- 9542
+
+actual_final_round <- data.frame(
+  crafts = 22888,
+  bennett = 16207)
+
+actual_transfer_perc <- data.frame(
+  crafts = 3551/Brakey_transfer,
+  bennett = 2739/Brakey_transfer
+)
+```
+
+```{r helper_funs}
+# given the probabilities of each option and the number of ballots to redistribute, return the number of ballots redistributed to Bennett and Craft.
+multinomial_p <- function(pBennet, pCraft, pUndecided, n){
+  r <- rmultinom(1, n, prob = c(pBennet, pCraft, pUndecided))
+  return(tibble(nBennet = r[1, 1], nCraft = r[2, 1]))
+}
+
+mnl_predict <- function(samples){
+    samples %>% 
+  mutate(pBennet = exp(b_muBennet_Intercept)/(1 + exp(b_muBennet_Intercept) + exp(b_muCrafts_Intercept)),
+         pCraft = exp(b_muCrafts_Intercept)/(1 + exp(b_muBennet_Intercept) + exp(b_muCrafts_Intercept)),
+         pUndecided = 1/(1 + exp(b_muBennet_Intercept) + exp(b_muCrafts_Intercept)),
+         multinom_dist = pmap(list(pBennet, pCraft, pUndecided, Brakey_transfer), multinomial_p)) %>%
+  unnest(multinom_dist) %>%
+  mutate(predCraft_final_round = nCraft_first_round + nCraft,
+         predBennet_final_round = nBennet_first_round + nBennet,
+         predCraft_final_round_perc = predCraft_final_round/(predCraft_final_round + predBennet_final_round),
+         predBennet_final_round_perc = predBennet_final_round/(predBennet_final_round + predCraft_final_round),
+         craft_minus_bennet = predCraft_final_round - predBennet_final_round,
+         craft_win = craft_minus_bennet > 0)
+}
+```
+
+## Prepare poll data
+
+We know Brakey will be eliminated, so filter rows to include only those have Brakey marked first. Treat non-response for rank2 as equivalent to "Undecided".
+
+
+```{r read_poll, message=FALSE, warning=FALSE}
+cvr_df<- read_csv("../../data/july2020_maine_house/cvr.csv")
+candidate_codes_df <- read_csv("../../data/july2020_maine_house/candidate_codes.csv")
+
+# filter only rows with first choice == 2
+
+cvr_subset_df <- 
+  cvr_df %>%
+  filter(rank1 == 2) %>% 
+  replace_na(list(rank2 = 4)) %>%
+  mutate(rank1 = recode_factor(rank1, `1` = "Bennet", `2` = "Brakey", `3` = "Crafts", `4` = "Undecided"),
+         rank2 = recode_factor(rank2, `1` = "Bennet", `2` = "Brakey", `3` = "Crafts", `4` = "Undecided")) %>%
+  select(first_choice = rank1, final_choice = rank2, weight)
+
+head(cvr_subset_df, 20)
+```
+
+#### Weighted breakdown of Brakey 2nd choices:
+
+```{r message=FALSE, warning=FALSE}
+cvr_subset_df %>% 
+  group_by(final_choice) %>%
+  summarize(weighted_n = sum(weight)) %>%
+  mutate(weighted_perc = weighted_n/sum(weighted_n))
+
+# store results for later plotting
+poll_mle <- data.frame(crafts = 0.399, bennett = 0.333)
+```
+
+## Model description
+
+Based on:
+https://en.wikipedia.org/wiki/Multinomial_logistic_regression#As_a_set_of_independent_binary_regressions
+
+Use a multinomial logistic model. Assume the choices are distributed by a multinomial likelihood.
+
+$$
+rank2_i \sim Multinomial(n=1, \pi_{Crafts}, \pi_{Bennett}, \pi_{Undecided})
+\\
+\pi_{Crafts} = P(rank2 = Crafts)\\
+\pi_{Bennett} = P(rank2 = Bennett)\\
+\pi_{Undecided} = P(rank2 = Undecided)
+$$
+
+The goal is to estimate the choice probabilities. In this case, because the model is simple (only one candidate being eliminated), a Dirichlet prior could be placed on the 3 choice probabilities. 
+
+$$
+(\pi_{Crafts}, \pi_{Bennett}, \pi_{Undecided}) \sim Dirichlet(\alpha_1, \alpha_2, \alpha_3)
+\\
+\alpha_1, \alpha_2, \alpha_3 \sim distribution()
+$$
+An alternative, which maintains more interpretable parameters as the regression becomes more complex, is to estimate the choice probabilities via their log odds ratios, using "Undecided" as a reference category.
+
+$$
+\displaystyle \log(\frac{P(Y = Crafts)}{P(Y = Undecided)}) = \alpha_{Crafts}
+\\
+\displaystyle \log(\frac{P(Y = Bennett)}{P(Y = Undecided)}) = \alpha_{Bennett}
+$$
+
+(Since we are only redistributing Brakey's votes in this example, there are no other predictors in the regression equation. Just an intercept. If we were redistributing ballots from two candidates, those two candidates could be included as predictors in addition to the intercepts.)
+
+The log odds ratios can be converted into choice probabilities for use in the likelihood function:
+
+
+$$
+P(Y = Crafts) = \frac{e^{a_{Crafts}}}{e^{a_{Crafts}} + e^{a_{Bennett}} + 1}
+\\
+P(Y = Bennett) = \frac{e^{a_{Bennett}}}{e^{a_{Crafts}} + e^{a_{Bennett}} + 1}
+\\
+P(Y = Undecided) = \frac{1}{e^{a_{Crafts}} + e^{a_{Bennett}} + 1}
+$$
+All that's left is a prior on each parameter. Aim for priors that lead the model to predict, prior to seeing any data, that Brakey's ballots get redistributed evenly between Crafts, Bennett, and Undecided. 
+
+$$
+\alpha_{Crafts} \sim Normal(0, 1.25)
+\\
+\alpha_{Bennett} \sim Normal(0, 1.25)
+$$
+
+## Prior check
+
+Craft received 19,337 votes in the first round.
+
+Bennet received 13,468 votes in the first round.
+
+Brakey received 9,542 votes in the first round. 
+
+Simulate the re-distribution of Brakey's ballots using samples from the prior 
+
+For each sample of prior values for the intercepts.
+
+1) For each draw, convert the two intercepts into the three probabilities (Craft, Bennet, and Undecided/Exhaust).
+
+2) Simulate the redistribution of Brakey's votes.
+
+3) Add the simulated redistribution to Craft's and Bennet's first round total to get an estimate of their final round totals.
+
+### Bad prior
+
+$$
+\alpha_{Crafts} \sim Normal(0, 10)
+\\
+\alpha_{Bennett} \sim Normal(0, 10)
+$$
+
+```{r}
+pr <- prior(normal(0, 10), dpar = "muBennet", class = "Intercept") + 
+  prior(normal(0, 10), dpar = "muCrafts", class = "Intercept") 
+
+fit <- brm(formula = final_choice|weights(weight) ~ 1,
+           data = cvr_subset_df,
+           family = categorical(refcat = "Undecided"),
+           prior = pr, sample_prior = "only", 
+           chains = 4, iter = 2000,
+           file = "intercept_only_badprior")
+
+prior_samples <- spread_draws(fit, b_muBennet_Intercept, b_muCrafts_Intercept)
+prior_samples_pred <- mnl_predict(prior_samples)
+posterior_summary(fit)
+```
+
+#### Joint prior on log odds
+```{r message=FALSE, warning=FALSE}
+
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = b_muCrafts_Intercept, y = b_muBennet_Intercept), alpha = 0.4) + theme_light()
+
+```
+
+#### Joint prior of Brakey transfer probabilties
+```{r message=FALSE, warning=FALSE}
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = pCraft, y = pBennet), alpha = 0.4) + 
+  xlab("probability of Brakey -> Craft") + 
+  ylab("probability of Brakey -> Bennett") + 
+  labs(subtitle = "Prior distribution of transfer probabilities to Crafts and Bennett") + 
+  theme_light()
+```
+
+#### Prior Predictive distribution of final round counts, percents, difference
+
+```{r message=FALSE, warning=FALSE}
+
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = predCraft_final_round, y = predBennet_final_round), alpha = 0.4) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Crafts and Bennet final round counts.") + 
+  xlab("predicted final count - Crafts") + 
+  ylab("Bennett") + 
+  theme(legend.position = "none")
+```
+
+```{r message=FALSE, warning=FALSE}
+crafts <- 
+  ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = predCraft_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Crafts final round percent.") + 
+  xlab("predicted final percent - Crafts") + 
+  xlim(0, 1)
+
+bennett <- 
+  ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = predBennet_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Bennett final round percent.") + 
+  xlab("predicted final percent - Bennett") + 
+  xlim(0, 1)
+
+plot_grid(crafts, bennett, ncol = 1)
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = craft_minus_bennet), binwidth = 50) + 
+  xlab("Crafts minus Bennett") + 
+  labs(subtitle = "Predictive distribution of differences in final round counts.") + 
+  theme_light()
+```
+
+Summary statistics:
+
+```{r}
+prior_samples_pred %>%
+  summarise(mean_craft = mean(predCraft_final_round),
+            lower95_craft = quantile(predCraft_final_round, 0.025),
+            upper95_craft = quantile(predCraft_final_round, 0.975),
+            mean_bennett = mean(predBennet_final_round),
+            lower95_bennett = quantile(predBennet_final_round, 0.025),
+            upper95_bennett = quantile(predBennet_final_round, 0.975),
+            prob_craft_win = mean(craft_win)) %>%
+  pivot_longer(everything(), names_to = "measurement")
+```
+
+```{r}
+prior_samples_pred %>%
+  summarise(mean_pCraft = mean(pCraft),
+            lower95_pCraft = quantile(pCraft, probs = 0.025),
+            upper95_pCraft = quantile(pCraft, probs = 0.975),
+            mean_pBennet = mean(pBennet),
+            lower95_pBennet = quantile(pBennet, probs = 0.025),
+            upper95_pBennet = quantile(pCraft, probs = 0.975)) %>%
+  pivot_longer(everything(), names_to = "measurement") %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+### Better Prior
+
+$$
+\alpha_{Crafts} \sim Normal(0, 1.25)
+\\
+\alpha_{Bennett} \sim Normal(0, 1.25)
+$$
+
+
+```{r}
+pr <- prior(normal(0, 1.25), dpar = "muBennet", class = "Intercept") + 
+  prior(normal(0, 1.25), dpar = "muCrafts", class = "Intercept") 
+
+fit <- brm(formula = final_choice|weights(weight) ~ 1,
+           data = cvr_subset_df,
+           family = categorical(refcat = "Undecided"),
+           prior = pr, sample_prior = "only", 
+           chains = 4, iter = 2000,
+           file = "intercept_only_betterprior")
+
+prior_samples <- spread_draws(fit, b_muBennet_Intercept, b_muCrafts_Intercept)
+prior_samples_pred <- mnl_predict(prior_samples)
+posterior_summary(fit)
+```
+
+#### Joint prior on log odds
+```{r}
+
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = b_muCrafts_Intercept, y = b_muBennet_Intercept), alpha = 0.4) + theme_light()
+
+```
+
+#### Joint prior of Brakey transfer probabilties
+```{r message=FALSE, warning=FALSE}
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = pCraft, y = pBennet), alpha = 0.4) + 
+  xlab("probability of Brakey -> Craft") + 
+  ylab("probability of Brakey -> Bennett") + 
+  labs(subtitle = "Prior distribution of transfer probabilities to Crafts and Bennett") + 
+  theme_light()
+```
+
+#### Prior Predictive distribution of final round counts, percents, difference
+
+```{r message=FALSE, warning=FALSE}
+
+ggplot(prior_samples_pred) + 
+  geom_point(aes(x = predCraft_final_round, y = predBennet_final_round), alpha = 0.4) + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Crafts and Bennet final round counts.") + 
+  xlab("predicted final count - Crafts") + 
+  ylab("Bennett") + 
+  theme(legend.position = "none")
+```
+
+```{r message=TRUE, warning=TRUE}
+crafts <- 
+  ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = predCraft_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Crafts final round percent.") + 
+  xlab("predicted final percent - Crafts") + 
+  xlim(0, 1)
+
+bennett <- 
+  ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = predBennet_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Bennett final round percent.") + 
+  xlab("predicted final percent - Bennett") + 
+  xlim(0, 1)
+
+plot_grid(crafts, bennett, ncol = 1)
+```
+
+```{r message=TRUE, warning=TRUE}
+ggplot(prior_samples_pred) + 
+  geom_histogram(aes(x = craft_minus_bennet), binwidth = 30) + 
+  xlab("Crafts minus Bennett") + 
+  labs(subtitle = "Predictive distribution of differences in final round counts.") + 
+  theme_light()
+```
+
+Some statisics:
+
+```{r message=TRUE, warning=TRUE}
+prior_samples_pred %>%
+  summarise(mean_craft = mean(predCraft_final_round),
+            lower95_craft = quantile(predCraft_final_round, 0.025),
+            upper95_craft = quantile(predCraft_final_round, 0.975),
+            mean_bennett = mean(predBennet_final_round),
+            lower95_bennett = quantile(predBennet_final_round, 0.025),
+            upper95_bennett = quantile(predBennet_final_round, 0.975),
+            prob_craft_win = mean(craft_win)) %>%
+  pivot_longer(everything(), names_to = "measurement")
+```
+
+```{r}
+prior_samples_pred %>%
+  summarise(mean_pCraft = mean(pCraft),
+            lower95_pCraft = quantile(pCraft, probs = 0.025),
+            upper95_pCraft = quantile(pCraft, probs = 0.975),
+            mean_pBennet = mean(pBennet),
+            lower95_pBennet = quantile(pBennet, probs = 0.025),
+            upper95_pBennet = quantile(pCraft, probs = 0.975)) %>%
+  pivot_longer(everything(), names_to = "measurement") %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+## Fit
+
+```{r}
+
+pr <- prior(normal(0, 1.25), dpar = "muBennet", class = "Intercept") + 
+  prior(normal(0, 1.25), dpar = "muCrafts", class = "Intercept") 
+
+fit <- brm(formula = final_choice|weights(weight) ~ 1,
+           data = cvr_subset_df,
+           family = categorical(refcat = "Undecided"),
+           prior = pr, sample_prior = "no", 
+           chains = 4, iter = 2000,
+           file = "intercept_only")
+
+post_samples <- spread_draws(fit, b_muBennet_Intercept, b_muCrafts_Intercept)
+post_samples_pred <- mnl_predict(post_samples)
+write_csv(post_samples_pred, "posterior_predictions.csv")
+posterior_summary(fit)
+```
+
+## Predictions
+
+Craft received 19,337 votes in the first round.
+
+Bennett received 13,468 votes in the first round.
+
+Brakey received 9,542 votes in the first round. 
+
+Simulate the re-distribution of Brakey's ballots using samples from the posterior. 
+
+For each sample of posterior values for the intercepts.
+
+1) For each draw, convert the two intercepts into the three probabilities (Craft, Bennet, and Undecided/Exhaust).
+
+2) Simulate the redistribution of Brakey's votes.
+
+3) Add the simulated redistribution to Craft's and Bennet's first round total to get an estimate of their final round totals.
+
+#### Joint posterior on log odds
+```{r message=FALSE, warning=FALSE}
+
+ggplot(post_samples_pred) + 
+  geom_point(aes(x = b_muCrafts_Intercept, y = b_muBennet_Intercept), alpha = 0.4) + theme_light()
+
+```
+
+#### Joint posterior of Brakey transfer probabilties
+```{r message=FALSE, warning=FALSE}
+ggplot(post_samples_pred) + 
+  geom_point(aes(x = pCraft, y = pBennet), alpha = 0.4) + 
+  geom_point(data = actual_transfer_perc, aes(x = crafts, y = bennett), color = "red", size = 2) + 
+  geom_point(data = prior_samples_pred, aes(x = pCraft, y = pBennet), color = "blue", alpha = 0.01) + 
+  geom_point(data = poll_mle, aes(x = crafts, y = bennett), color = "green", size = 2) + 
+  xlim(0,1) + 
+  ylim(0,1) + 
+  xlab("probability of Brakey -> Craft") + 
+  ylab("probability of Brakey -> Bennett") + 
+  labs(subtitle = "Posterior distribution of transfer probabilities to Crafts and Bennett.\nRed dot is actual Brakey tranfer probability.\nGreen dot is MLE from poll.\nBlue points indicate prior distribution.") + 
+  theme_light()
+```
+
+#### Posterior Predictive distribution of final round counts, percents, difference
+
+```{r message=FALSE, warning=FALSE}
+
+ggplot(post_samples_pred) + 
+  geom_point(aes(x = predCraft_final_round, y = predBennet_final_round), alpha = 0.4) + 
+  geom_point(data = prior_samples_pred, aes(x = predCraft_final_round, y = predBennet_final_round), alpha = 0.01, color = "blue") + 
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") + 
+  theme_light() + 
+  geom_point(data = actual_final_round, aes(x = crafts, y = bennett), color = "red", size = 2) + 
+  xlim(nCraft_first_round, nCraft_first_round + Brakey_transfer) +
+  ylim(nBennet_first_round, nBennet_first_round + Brakey_transfer) + 
+  labs(subtitle = "Predicitive distribution for Crafts and Bennet final round counts.\nRed dot is actual final round count.\nLight blue points indicate prior distribution.") + 
+  xlab("predicted final count - Crafts") + 
+  ylab("Bennett") + 
+  theme(legend.position = "none")
+```
+
+```{r message=FALSE, warning=FALSE}
+crafts <- 
+  ggplot(post_samples_pred) + 
+  geom_histogram(aes(x = predCraft_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Crafts final round percent.") + 
+  xlab("posterior predicted final percent - Crafts") + 
+  xlim(0, 1)
+
+bennett <- 
+  ggplot(post_samples_pred) + 
+  geom_histogram(aes(x = predBennet_final_round_perc), binwidth = 0.01, color="black", fill="lightblue") + 
+  theme_light() + 
+  labs(subtitle = "Predicitive distribution for Bennett final round percent.") + 
+  xlab("posterior predicted final percent - Bennett") + 
+  xlim(0, 1)
+
+plot_grid(crafts, bennett, ncol = 1)
+```
+
+```{r}
+ggplot(post_samples_pred) + 
+  geom_histogram(aes(x = craft_minus_bennet), binwidth = 30) + 
+  geom_vline(xintercept = actual_final_round$crafts - actual_final_round$bennett, color = "red") + 
+  xlab("Crafts minus Bennett") + 
+  labs(subtitle = "Predictive distribution of differences in final round counts.\n Red line is actual difference.") + 
+  theme_light()
+```
+
+Summary statistics:
+
+```{r}
+post_samples_pred %>%
+  summarise(mean_craft = mean(predCraft_final_round),
+            lower95_craft = quantile(predCraft_final_round, 0.025),
+            upper95_craft = quantile(predCraft_final_round, 0.975),
+            mean_bennett = mean(predBennet_final_round),
+            lower95_bennett = quantile(predBennet_final_round, 0.025),
+            upper95_bennett = quantile(predBennet_final_round, 0.975),
+            prob_craft_win = mean(craft_win)) %>%
+  pivot_longer(everything(), names_to = "measurement")
+```
+
+```{r}
+post_samples_pred %>%
+  summarise(mean_pCraft = mean(pCraft),
+            lower95_pCraft = quantile(pCraft, probs = 0.025),
+            upper95_pCraft = quantile(pCraft, probs = 0.975),
+            mean_pBennet = mean(pBennet),
+            lower95_pBennet = quantile(pBennet, probs = 0.025),
+            upper95_pBennet = quantile(pCraft, probs = 0.975)) %>%
+  pivot_longer(everything(), names_to = "measurement") %>%
+  mutate_if(is.numeric, round, 2)
+```
