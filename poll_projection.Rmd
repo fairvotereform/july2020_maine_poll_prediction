@@ -77,8 +77,8 @@ We know Brakey will be eliminated, so filter rows to include only those have Bra
 
 
 ```{r read_poll, message=FALSE, warning=FALSE}
-cvr_df<- read_csv("../../data/july2020_maine_house/cvr.csv")
-candidate_codes_df <- read_csv("../../data/july2020_maine_house/candidate_codes.csv")
+cvr_df<- read_csv("data/july2020_maine_house/cvr.csv")
+candidate_codes_df <- read_csv("data/july2020_maine_house/candidate_codes.csv")
 
 # filter only rows with first choice == 2
 
