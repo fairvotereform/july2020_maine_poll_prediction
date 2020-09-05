@@ -142,7 +142,7 @@ P(Y = Bennett) = \frac{e^{a_{Bennett}}}{e^{a_{Crafts}} + e^{a_{Bennett}} + 1}
 \\
 P(Y = Undecided) = \frac{1}{e^{a_{Crafts}} + e^{a_{Bennett}} + 1}
 $$
-All that's left is a prior on each parameter. Aim for priors that lead the model to predict, prior to seeing any data, that Brakey's ballots get redistributed evenly between Crafts, Bennett, and Undecided. 
+All that's left is a prior on each parameter. Aim for a prior that makes all sets of choice probabilities equally likely.
 
 $$
 \alpha_{Crafts} \sim Normal(0, 1.25)
